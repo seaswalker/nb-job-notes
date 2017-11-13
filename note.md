@@ -134,7 +134,78 @@ List<JobDescriptor> jobDescriptorList = jobScanner.getJobDescriptorList();
 }
 ```
 
-可以看出，是否是Spring环境的判断是通过寻找applicationContext.xml实现的。
+可以看出，是否是Spring环境的判断是通过寻找applicationContext.xml实现的。这里遍历jar包内的所有文件，如果是一个class文件，那么调用scanClass方法进行处理，此方法的逻辑很简单，总结如下:
+
+- 使用自定义的类加载器对类进行加载
+- 检查类的包名是否在给定的扫描包名集合内
+- 扫描类中所有被@Schedule标注的注解，将每个被标注的方法包装成为JobDescriptor保存在JobScanner的内部字段jobDescriptorList中
+
+### 任务保存
+
+最后将每个扫描得到的JobDescriptor保存到数据库的master_slave_job和master_slave_job_summary表中。
+
+## 切换执行
+
+任务上传后并不会开始执行，而是需要在Job Runtime manager页面进行手动的启用，当然也可以手动地停止。这一操作通过接口/masterSlaveJobSummaries/update实现。
+
+### 任务数据查询
+
+这一步其实是一个有则更新，没有创建的过程，任务数据存储在zookeeper中，相关源码:
+
+```java
+MasterSlaveJobData masterSlaveJobData = masterSlaveApiFactory.jobApi()
+    .getJob(masterSlaveJobSummary.getGroupName(), masterSlaveJobSummary.getJobName());
+```
+
+在这里任务名其实就是方法名，组名就是类名，数据在zookeeper上存储的路径的格式为:
+
+/master-slave-node/jobs/组名/.job名
+
+getJob方法源码:
+
+```java
+@Override
+public MasterSlaveJobData getJob(String path) {
+    return new MasterSlaveJobData(getData(path));
+}
+```
+
+getData是一个工具方法，用于获取指定路径的数据:
+
+```java
+protected ChildData getData(String path) {
+    try {
+        return new ChildData(path, EMPTY_STAT, client.getData().forPath(path));
+    } catch (Exception e) {
+        throw new NiubiException(e);
+    }
+}
+```
+
+### 更新数据库
+
+这一步主要是将数据库master_slave_job_summary表的job_state字段修改为Executing.
+
+### 任务发布
+
+这一步是核心，相关源码:
+
+```java
+@Override
+public void saveJob(String group, String name, MasterSlaveJobData.Data data) {
+    MasterSlaveJobData masterSlaveJobData = 
+        new MasterSlaveJobData(PathHelper
+        .getJobPath(getMasterSlavePathApi().getJobPath(), group, name), data);
+    masterSlaveJobData.getData().incrementVersion();
+    if (checkExists(masterSlaveJobData.getPath())) {
+        setData(masterSlaveJobData.getPath(), masterSlaveJobData.getDataBytes());
+    } else {
+        create(masterSlaveJobData.getPath(), JsonHelper.toBytes(masterSlaveJobData.getData()));
+    }
+}
+```
+
+setDate和cretate均是基于curator封装的工具方法。
 
 # cluster
 
