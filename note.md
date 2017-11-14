@@ -205,7 +205,9 @@ public void saveJob(String group, String name, MasterSlaveJobData.Data data) {
 }
 ```
 
-setDate和cretate均是基于curator封装的工具方法。
+setDate和cretate均是基于curator封装的工具方法。可以推测出，在任务节点上必定对zookeeper的存储节点进行了订阅。
+
+数据保存的格式为: 将MasterSlaveJobData对象首先转化为json字符串的形式，最终再将字符串转化为byte数组保存到zookeeper中。
 
 # cluster
 
@@ -283,7 +285,7 @@ ${java_command} -jar niubi-job-cluster.jar $1
 
 #### Master-Slave
 
-MasterSlaveNode构造器进行了大量个组件初始化工作。
+MasterSlaveNode构造器进行了大量的组件初始化工作。
 
 ##### zookeeper客户端
 
@@ -298,19 +300,60 @@ RetryPolicy接口代表了当间接ZK失败时的重试策略，这里使用的�
 
 ##### 分布式锁
 
-节点的初始化需要在持有初始化分布式锁的情况下进行，锁的路径是: /master-slave-node/initLock，这里的锁便是InterProcessMutex。
+锁的路径是: /master-slave-node/initLock，这里的锁便是InterProcessMutex，锁了之后只调用了initJobs方法，在这个方法里只做了一件事: 那就是检查现在所有存活的节点，有过没有，那么将所有已发布的任务置为shutdown状态。。。
 
-真正的逻辑位于MasterSlaveNode的doJoin方法:
+##### 节点注册
+
+这一步便是将自己注册到zookeeper中去，相关源码:
 
 ```java
-@Override
-protected synchronized void doJoin() {
-    leaderSelector.start();
-    try {
-        this.jobCache.start();
-    } catch (Exception e) {
-        LoggerHelper.error("path children path start failed.", e);
-        throw new NiubiException(e);
+this.nodePath = 
+    masterSlaveApiFactory.nodeApi().saveNode(new MasterSlaveNodeData.Data(getNodeIp()));
+```
+
+数据保存的路径是/master-slave-node/nodes/child/节点IP，数据的内容便是byte数组形式的IP地址。
+
+##### 节点监听
+
+这一步便是注册集群节点变化的监听器，相关源码:
+
+```java
+this.nodeCache = new PathChildrenCache(client, 
+    PathHelper.getParentPath(masterSlaveApiFactory.pathApi().getNodePath()), true);
+this.nodeCache.getListenable().addListener(new NodeCacheListener());
+```
+
+PathChildrenCache是curator提供的一个工具类，将会**自动与zookeeper服务器上的给定的路径保持一致**。
+
+关键便是NodeCacheListener:
+
+```java
+private class NodeCacheListener implements PathChildrenCacheListener {
+    @Override
+    public synchronized void childEvent(CuratorFramework client, PathChildrenCacheEvent event) {
+        AssertHelper.isTrue(isJoined(), "illegal state .");
+        //对Master权限进行双重检查
+        if (!leaderSelector.hasLeadership()) {
+            return;
+        }
+        if (EventHelper.isChildRemoveEvent(event)) {
+            MasterSlaveNodeData masterSlaveNodeData = 
+                new MasterSlaveNodeData(event.getData().getPath(), event.getData().getData());
+            releaseJobs(masterSlaveNodeData.getPath(), masterSlaveNodeData.getData());
+        }
     }
 }
 ```
+
+关键就在于检测到节点移除事件时的释放任务操作，这里需要参考后面。
+
+##### 任务监听
+
+```java
+this.jobCache = 
+    new PathChildrenCache(client, masterSlaveApiFactory.pathApi().getJobPath(), true);
+this.jobCache.getListenable().addListener(new JobCacheListener());
+```
+
+上面的任务一节也提到了，这里监听的路径是: /job-root/master-slave-node/jobs，
+
