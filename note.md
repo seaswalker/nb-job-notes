@@ -311,7 +311,9 @@ this.nodePath =
     masterSlaveApiFactory.nodeApi().saveNode(new MasterSlaveNodeData.Data(getNodeIp()));
 ```
 
-数据保存的路径是/master-slave-node/nodes/child/节点IP，数据的内容便是byte数组形式的IP地址。
+节点的注册路径的格式为:
+
+ /job-root/master-slave-node/nodes/child0000000006，后面的序号依次递增。
 
 ##### 节点监听
 
@@ -331,9 +333,8 @@ PathChildrenCache是curator提供的一个工具类，将会**自动与zookeeper
 private class NodeCacheListener implements PathChildrenCacheListener {
     @Override
     public synchronized void childEvent(CuratorFramework client, PathChildrenCacheEvent event) {
-        AssertHelper.isTrue(isJoined(), "illegal state .");
-        //对Master权限进行双重检查
-        if (!leaderSelector.hasLeadership()) {
+      //必须在master节点上执行  
+      if (!leaderSelector.hasLeadership()) {
             return;
         }
         if (EventHelper.isChildRemoveEvent(event)) {
@@ -345,7 +346,27 @@ private class NodeCacheListener implements PathChildrenCacheListener {
 }
 ```
 
-关键就在于检测到节点移除事件时的释放任务操作，这里需要参考后面。
+关键就在于检测到节点移除事件时的释放任务操作，releaseJobs:
+
+```java
+private void releaseJobs(String nodePath, MasterSlaveNodeData.Data nodeData) {
+    if (ListHelper.isEmpty(nodeData.getJobPaths())) {
+        return;
+    }
+    for (String path : nodeData.getJobPaths()) {
+        MasterSlaveJobData.Data data = masterSlaveApiFactory.jobApi().getJob(path).getData();
+        if (this.nodePath.equals(nodePath)) {
+            schedulerManager.shutdown(data.getGroupName(), data.getJobName());
+        }
+        data.release();
+        masterSlaveApiFactory.jobApi().updateJob(data.getGroupName(), data.getJobName(), data);
+    }
+}
+```
+
+此方法所做的总结如下: 
+
+**将被移除节点上正在执行的任务重新在集群中进行分发**，如果被移除的是当前节点(即master节点)，那么停止所有正在执行的任务。这一点感觉比较诡异，自己被移除了?
 
 ##### 任务监听
 
@@ -355,5 +376,107 @@ this.jobCache =
 this.jobCache.getListenable().addListener(new JobCacheListener());
 ```
 
-上面的任务一节也提到了，这里监听的路径是: /job-root/master-slave-node/jobs，
+上面的任务一节也提到了，这里监听的路径是: /job-root/master-slave-node/jobs，这里的核心便是监听器JobCacheListener的实现，其工作逻辑可总结为下图:
+
+![任务监听逻辑](images/job_listener.png)
+
+可以得出结论: zookeeper的监听机制当有事件发生时，所有的节点都会收到通知。
+
+###### 已分配?
+
+如何判断一个任务是否已经被分配了呢？答案在于任务数据的nodePath属性，如果此任务已被分配，那么其nodePath属性将被设置为被分配节点在zookeeper的路径。
+
+###### 节点分配逻辑
+
+这里采用的是**每次选取正在执行任务数最小的节点**，相关源码:
+
+```java
+List<MasterSlaveNodeData> masterSlaveNodeDataList = 
+    masterSlaveApiFactory.nodeApi().getAllNodes();
+Collections.sort(masterSlaveNodeDataList);
+data.setNodePath(masterSlaveNodeDataList.get(0).getPath());
+masterSlaveApiFactory.jobApi().updateJob(data.getGroupName(), data.getJobName(), data);
+```
+
+AbstractNodeData实现了Comparable接口:
+
+```java
+@Override
+public int compareTo(AbstractNodeData data) {
+    return this.runningJobCount - data.getRunningJobCount();
+}
+```
+
+###### 执行失败
+
+任务的执行逻辑将在后续章节专门说明，这里只看下如果执行失败了如何处理。逻辑位于MasterSlaveNode的executeOperation方法:
+
+```java
+private void executeOperation(MasterSlaveNodeData.Data nodeData, MasterSlaveJobData jobData) {
+    MasterSlaveJobData.Data data = jobData.getData();
+    try {
+        //计算...
+    } catch (Throwable e) {
+        LoggerHelper.error("handle operation failed. " + data, e);
+        //更新任务状态
+        data.operateFailed(ExceptionHelper.getStackTrace(e, true));
+        //重试，等待再次调度
+        masterSlaveApiFactory.jobApi().updateJob(data.getGroupName(), data.getJobName(), data);
+    }
+}
+```
+
+## 任务执行
+
+MasterSlaveNode.executeOperation:
+
+```java
+private void executeOperation(MasterSlaveNodeData.Data nodeData, MasterSlaveJobData jobData) {
+    MasterSlaveJobData.Data data = jobData.getData();
+    if (data.isStart() || data.isRestart()) {
+        schedulerManager.startupManual(downloadJarFile(data.getJarFileName()), 
+            data.getPackagesToScan(), data.isSpring(), data.getGroupName(), data.getJobName(), 
+            data.getJobCron(), data.getMisfirePolicy());
+        if (data.isStart()) {
+            nodeData.addJobPath(jobData.getPath());
+        }
+        data.setJobState("Startup");
+    } else {
+        schedulerManager.shutdown(data.getGroupName(), data.getJobName());
+        nodeData.removeJobPath(jobData.getPath());
+        data.clearNodePath();
+        data.setJobState("Pause");
+    }
+    data.operateSuccess();
+    masterSlaveApiFactory.jobApi().updateJob(data.getGroupName(), data.getJobName(), data);
+    masterSlaveApiFactory.nodeApi().updateNode(nodePath, nodeData);
+}
+```
+
+操作的区分是通过jobOperation字段完成的，其实就是简单的字符串，比如开始为Start，节点也会记录下自己正在执行的任务(记录其唯一的路径值):
+
+```java
+public void addJobPath(String jobPath) {
+    if (jobPaths == null) {
+        jobPaths = new ArrayList<>();
+    }
+    jobPaths.add(jobPath);
+    //增加正在执行的任务数
+    increment();
+}
+```
+
+任务的控制通过ScheduleManager接口来完成:
+
+![ScheduleManager](images/ScheduleManager.png)
+
+接口包含的方法如下:
+
+![ScheduleManager方法](images/ScheduleManager_methods.png)
+
+
+
+
+
+
 
