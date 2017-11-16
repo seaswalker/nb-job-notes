@@ -426,6 +426,23 @@ private void executeOperation(MasterSlaveNodeData.Data nodeData, MasterSlaveJobD
 }
 ```
 
+### Master选举
+
+在MasterSlaveNode的构造器中注册:
+
+```java
+this.leaderSelector = new LeaderSelector(client, 
+                                         masterSlaveApiFactory.pathApi().getSelectorPath(), 
+                                         new MasterSlaveLeadershipSelectorListener());
+this.leaderSelector.autoRequeue();
+```
+
+curator的选举监听器必须实现LeaderSelectorListener接口:
+
+![LeaderSelector](images/leader_selector.png)
+
+
+
 ## 任务执行
 
 MasterSlaveNode.executeOperation:
@@ -478,7 +495,7 @@ ScheduleManager在AbstractClusterJobNode的构造器中进行初始化，如下:
 
 ```java
 public AbstractClusterJobNode() {
-	this.schedulerManager = new DefaultManualScheduleManager(Bootstrap.properties());
+    this.schedulerManager = new DefaultManualScheduleManager(Bootstrap.properties());
 }
 ```
 
@@ -486,8 +503,8 @@ public AbstractClusterJobNode() {
 
 ```java
 public DefaultManualScheduleManager(Properties properties) {
-	initScheduler(properties);
-	JobDataMapManager.initManualScheduler(scheduler);
+    initScheduler(properties);
+    JobDataMapManager.initManualScheduler(scheduler);
 }
 ```
 
@@ -495,11 +512,11 @@ public DefaultManualScheduleManager(Properties properties) {
 
 ```java
 protected void initScheduler(Properties properties) {
-	this.properties = properties;
-	StdSchedulerFactory schedulerFactory = new StdSchedulerFactory();
-	schedulerFactory.initialize(properties);
-	scheduler = schedulerFactory.getScheduler();
-	scheduler.start();
+    this.properties = properties;
+    StdSchedulerFactory schedulerFactory = new StdSchedulerFactory();
+    schedulerFactory.initialize(properties);
+    scheduler = schedulerFactory.getScheduler();
+    scheduler.start();
 }
 ```
 
@@ -511,7 +528,7 @@ protected void initScheduler(Properties properties) {
 
 ```java
 protected String downloadJarFile(String jarFileName) {
-	return JarFileHelper.downloadJarFile(Bootstrap.getJobDir(),
+    return JarFileHelper.downloadJarFile(Bootstrap.getJobDir(),
                                          Bootstrap.getJarUrl(jarFileName));
 }
 ```
@@ -532,13 +549,13 @@ JarFileHelper.downloadJarFile:
 
 ```java
 static String downloadJarFile(String jarFileParentPath, String jarUrl) {
-	String jarFileName = jarUrl.substring(jarUrl.lastIndexOf("/") + 1);
-	String jarFilePath = StringHelper.appendSlant(jarFileParentPath) + jarFileName;
-	File file = new File(jarFilePath);
-	if (file.exists()) {
-		return jarFilePath;
-	}
-	return HttpHelper.downloadRemoteResource(jarFilePath, jarUrl);
+    String jarFileName = jarUrl.substring(jarUrl.lastIndexOf("/") + 1);
+    String jarFilePath = StringHelper.appendSlant(jarFileParentPath) + jarFileName;
+    File file = new File(jarFilePath);
+    if (file.exists()) {
+        return jarFilePath;
+    }
+    return HttpHelper.downloadRemoteResource(jarFilePath, jarUrl);
 }
 ```
 
@@ -572,19 +589,19 @@ getJobBean的参数为完整类名。
 
 ```java
 protected JobBeanFactory createJobBeanFactory(String jarFilePath, boolean isSpring) {
-	String jobBeanFactoryClassName;
-	if (isSpring) {
-		jobBeanFactoryClassName = "com.zuoxiaolong.niubi.job.spring.bean.SpringJobBeanFactory";
-	} else {
-		jobBeanFactoryClassName = 
-        	"com.zuoxiaolong.niubi.job.scheduler.bean.DefaultJobBeanFactory";
-	}
-	ClassLoader jarApplicationClassLoader = 
-    	ApplicationClassLoaderFactory.getJarApplicationClassLoader(jarFilePath);
-	Class jobBeanFactoryClass = jarApplicationClassLoader.loadClass(jobBeanFactoryClassName);
-	Class<?>[] parameterTypes = new Class[]{ClassLoader.class};
-	Constructor jobBeanFactoryConstructor = jobBeanFactoryClass.getConstructor(parameterTypes);
-	return jobBeanFactoryConstructor.newInstance(jarApplicationClassLoader);
+    String jobBeanFactoryClassName;
+    if (isSpring) {
+        jobBeanFactoryClassName = "com.zuoxiaolong.niubi.job.spring.bean.SpringJobBeanFactory";
+    } else {
+        jobBeanFactoryClassName = 
+            "com.zuoxiaolong.niubi.job.scheduler.bean.DefaultJobBeanFactory";
+    }
+    ClassLoader jarApplicationClassLoader = 
+        ApplicationClassLoaderFactory.getJarApplicationClassLoader(jarFilePath);
+    Class jobBeanFactoryClass = jarApplicationClassLoader.loadClass(jobBeanFactoryClassName);
+    Class<?>[] parameterTypes = new Class[]{ClassLoader.class};
+    Constructor jobBeanFactoryConstructor = jobBeanFactoryClass.getConstructor(parameterTypes);
+    return jobBeanFactoryConstructor.newInstance(jarApplicationClassLoader);
 }
 ```
 
@@ -600,10 +617,10 @@ DefaultJobBeanFactory的构造器只是进行了一个赋值操作，getJobBean�
 
 ```java
 public SpringJobBeanFactory(ClassLoader classLoader) throws BeansException {
-	this.classLoader = classLoader;
-	ClassUtils.overrideThreadContextClassLoader(classLoader);
-	this.applicationContext = 
-      	new ClassPathXmlApplicationContext(JobScanner.APPLICATION_CONTEXT_XML_PATH);
+    this.classLoader = classLoader;
+    ClassUtils.overrideThreadContextClassLoader(classLoader);
+    this.applicationContext = 
+        new ClassPathXmlApplicationContext(JobScanner.APPLICATION_CONTEXT_XML_PATH);
 }
 ```
 
@@ -615,9 +632,9 @@ getJobBean就很简单了，委托给Spring容器就好了。
 
 ```java
 ClassLoader classLoader = 
-  	ApplicationClassLoaderFactory.getJarApplicationClassLoader(jarFilePath);
+    ApplicationClassLoaderFactory.getJarApplicationClassLoader(jarFilePath);
 JobScanner jobScanner = 
-	JobScannerFactory.createJarFileJobScanner(classLoader, packagesToScan, jarFilePath);
+    JobScannerFactory.createJarFileJobScanner(classLoader, packagesToScan, jarFilePath);
 jobDescriptorListMap.put(jarFilePath, jobScanner.getJobDescriptorList());
 ```
 
@@ -635,7 +652,11 @@ jobDescriptorListMap.put(jarFilePath, jobScanner.getJobDescriptorList());
 
 ![任务定义](images/job.png)
 
+## 任务中断
 
+当正在执行任务的节点被移除或用户手动触发了任务的停止时，将会导致AbstractScheduleManager的shutdown方法被调用，而实现的逻辑也很简单:
+
+当quartz的Scheduler处于启动状态、任务处于STARTUP状态时，将其pause掉，注意这里没有删除。
 
 
 
