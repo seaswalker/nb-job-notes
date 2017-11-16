@@ -474,6 +474,167 @@ public void addJobPath(String jobPath) {
 
 ![ScheduleManager方法](images/ScheduleManager_methods.png)
 
+ScheduleManager在AbstractClusterJobNode的构造器中进行初始化，如下:
+
+```java
+public AbstractClusterJobNode() {
+	this.schedulerManager = new DefaultManualScheduleManager(Bootstrap.properties());
+}
+```
+
+构造器源码:
+
+```java
+public DefaultManualScheduleManager(Properties properties) {
+	initScheduler(properties);
+	JobDataMapManager.initManualScheduler(scheduler);
+}
+```
+
+系统内部采用Quartz调度器进行任务的调度执行，initScheduler便是用于初始化Quartz调度接口:
+
+```java
+protected void initScheduler(Properties properties) {
+	this.properties = properties;
+	StdSchedulerFactory schedulerFactory = new StdSchedulerFactory();
+	schedulerFactory.initialize(properties);
+	scheduler = schedulerFactory.getScheduler();
+	scheduler.start();
+}
+```
+
+### Jar包下载
+
+任务以jar包的形式存在，从前面任务上传一节可以看出，jar包放在了console模块，所以，在任务执行之前将其下载到本地。
+
+下载由AbstractClusterJobNode.downloadJarFile方法完成:
+
+```java
+protected String downloadJarFile(String jarFileName) {
+	return JarFileHelper.downloadJarFile(Bootstrap.getJobDir(),
+                                         Bootstrap.getJarUrl(jarFileName));
+}
+```
+
+任务在本地的存放路径为cluster模块安装路径下的job/masterSlave，jarUrl指向console模块的web地址，web地址由配置文件job.properties决定:
+
+```properties
+jar.repertory.url=http://localhost:8080/niubi-job
+```
+
+以master-slave模式、test-job.jar为例，那么url就是:
+
+```html
+http://localhost:8080/niubi-job/job/masterSlave/test-job.jar
+```
+
+JarFileHelper.downloadJarFile:
+
+```java
+static String downloadJarFile(String jarFileParentPath, String jarUrl) {
+	String jarFileName = jarUrl.substring(jarUrl.lastIndexOf("/") + 1);
+	String jarFilePath = StringHelper.appendSlant(jarFileParentPath) + jarFileName;
+	File file = new File(jarFilePath);
+	if (file.exists()) {
+		return jarFilePath;
+	}
+	return HttpHelper.downloadRemoteResource(jarFilePath, jarUrl);
+}
+```
+
+方法首先会检查在本地是否已经存在此jar包，否则会以HTTP请求的方式向console模块进行请求，console模块配置了静态资源处理来提供jar包下载服务:
+
+```xml
+<mvc:resources mapping="/job/**" location="/job/"/>
+```
+
+downloadJarFile返回的是最终保存在本地的路径。
+
+### 环境初始化
+
+位于DefaultManualScheduleManager.startupManual方法:
+
+```java
+JobEnvironmentCache.instance().loadJobEnvironment(jarFilePath, packagesToScan, isSpring);
+```
+
+JobEnvironmentCache是一个缓存，缓存每个任务的执行环境，"环境"其实就是一个JobBeanFactory和一组JobDescriptor.
+
+#### JobBeanFactory
+
+此接口在Spring环境和非Spring环境之上提供了一层抽象，用以获取任务所在类的对象。
+
+![JobBeanFactory](images/JobBeanFactory.png)
+
+getJobBean的参数为完整类名。
+
+下面看一下这货如何初始化的:
+
+```java
+protected JobBeanFactory createJobBeanFactory(String jarFilePath, boolean isSpring) {
+	String jobBeanFactoryClassName;
+	if (isSpring) {
+		jobBeanFactoryClassName = "com.zuoxiaolong.niubi.job.spring.bean.SpringJobBeanFactory";
+	} else {
+		jobBeanFactoryClassName = 
+        	"com.zuoxiaolong.niubi.job.scheduler.bean.DefaultJobBeanFactory";
+	}
+	ClassLoader jarApplicationClassLoader = 
+    	ApplicationClassLoaderFactory.getJarApplicationClassLoader(jarFilePath);
+	Class jobBeanFactoryClass = jarApplicationClassLoader.loadClass(jobBeanFactoryClassName);
+	Class<?>[] parameterTypes = new Class[]{ClassLoader.class};
+	Constructor jobBeanFactoryConstructor = jobBeanFactoryClass.getConstructor(parameterTypes);
+	return jobBeanFactoryConstructor.newInstance(jarApplicationClassLoader);
+}
+```
+
+可以看出，从这里开始就已经开始使用自定义的类加载器进行各种操作了，另外加载器的粒度是**每个任务jar包有自己特定的类加载器**。
+
+##### 默认
+
+DefaultJobBeanFactory的构造器只是进行了一个赋值操作，getJobBean方法的实现也很简单: 使用给定的加载器对类进行加载，然后返回使用默认构造器构造的对象。
+
+##### Spring
+
+先来看看构造器:
+
+```java
+public SpringJobBeanFactory(ClassLoader classLoader) throws BeansException {
+	this.classLoader = classLoader;
+	ClassUtils.overrideThreadContextClassLoader(classLoader);
+	this.applicationContext = 
+      	new ClassPathXmlApplicationContext(JobScanner.APPLICATION_CONTEXT_XML_PATH);
+}
+```
+
+ClassUtils是Spring的方法，通过overrideThreadContextClassLoader方法便确定了Spring整个生命周期所使用的类加载器。
+
+getJobBean就很简单了，委托给Spring容器就好了。
+
+#### 任务扫描
+
+```java
+ClassLoader classLoader = 
+  	ApplicationClassLoaderFactory.getJarApplicationClassLoader(jarFilePath);
+JobScanner jobScanner = 
+	JobScannerFactory.createJarFileJobScanner(classLoader, packagesToScan, jarFilePath);
+jobDescriptorListMap.put(jarFilePath, jobScanner.getJobDescriptorList());
+```
+
+和console模块任务上传时的逻辑完全相同。
+
+### 调度
+
+位于DefaultManualScheduleManager的startupManual方法中，逻辑可以总结如下:
+
+1. 将任务保存到quartz中，此时任务处于睡眠状态，等待调度。
+2. 如果此任务之前没有被调度过或者处于SHUTDOWN状态，那么按照给定的cron表达式触发调度。
+3. 如果已经被调度过并且状态为STARTUP或PAUSE，那么检查已经存在的cron表达式和当前的是否一致。如果不一致，那么使用新的cron表达式重新调度执行，如果一致，那么恢复任务的执行(如果之前处于PAUSE状态)。
+
+这里只关注一个quartz的细节，系统是如何将我们的任务转化为quartz任务。quartz的任务由Job接口定义，系统的实现StubJob负责用反射的方法调用我们任务bean的任务方法。
+
+![任务定义](images/job.png)
+
 
 
 
