@@ -441,7 +441,99 @@ curator的选举监听器必须实现LeaderSelectorListener接口:
 
 ![LeaderSelector](images/leader_selector.png)
 
+#### 获得
 
+当此节点获取到领导权时，takeLeadership方法将会被调用，注意，**此方法不能返回，直到节点失去/放弃领导权**。
+
+AbstractLeadershipSelectorListener实现了此方法:
+
+```java
+public void takeLeadership(CuratorFramework curatorFramework) {
+    boolean isJoined = isJoined();
+    try {
+        if (isJoined) {
+            acquireLeadership();
+        }
+    } catch (Throwable e) {
+        relinquishLeadership();
+        return;
+    }
+    try {
+        synchronized (mutex) {
+            mutex.wait();
+        }
+    } catch (InterruptedException e) {
+        //日志
+    }
+}
+```
+
+acquireLeadership为模板方法，由子类MasterSlaveLeadershipSelectorListener实现，负责系统相关的操作:
+
+```java
+@Override
+public void acquireLeadership() throws Exception {
+    //1.检查是否有消失了的节点
+    checkUnavailableNode();
+    //2.更改当前节点的state
+    MasterSlaveNodeData masterSlaveNodeData = masterSlaveApiFactory.nodeApi().getNode(nodePath);
+    masterSlaveNodeData.getData().setNodeState("Master");
+    masterSlaveApiFactory.nodeApi().updateNode(nodePath, masterSlaveNodeData.getData());
+    //3.启动节点监听
+    nodeCache.start();
+}
+```
+
+#### 失去
+
+失去领导权由ConnectionStateListener的stateChanged方法负责通知，AbstractLeadershipSelectorListener实现了此方法:
+
+```java
+public void stateChanged(CuratorFramework client, ConnectionState newState) {
+    if (!newState.isConnected()) {
+        relinquishLeadership();
+        synchronized (mutex) {
+            mutex.notify();
+        }
+    }
+}
+```
+
+relinquishLeadership同样是模板方法:
+
+```java
+@Override
+public void relinquishLeadership() {
+    //1.关闭节点监听
+    if (nodeCache != null) {
+        nodeCache.close();
+    }
+    if (client.getState() == CuratorFrameworkState.STARTED) {
+        //2.释放正在运行的任务, why?
+        MasterSlaveNodeData.Data nodeData = new MasterSlaveNodeData.Data(getNodeIp());
+        releaseJobs(nodePath, nodeData);
+        //3.节点状态更新
+        nodeData.setNodeState("Slave");
+        masterSlaveApiFactory.nodeApi().updateNode(nodePath, nodeData);
+    }
+}
+```
+
+### Join
+
+上面共涉及到了3个监听器，分别是领导权选举、任务监听和节点监听，但是上面只是注册，并未启动!
+
+MasterSlaveNode.doJoin:
+
+```java
+@Override
+protected synchronized void doJoin() {
+    leaderSelector.start();
+    this.jobCache.start();
+}
+```
+
+这里才是启动，节点监听的启动位置在上面一节见过了，**只有获得了领导权的节点才可以启动节点监听**。
 
 ## 任务执行
 
