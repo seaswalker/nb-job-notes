@@ -60,7 +60,7 @@ public static ClassLoader getDefaultClassLoader() {
             try {
                 cl = ClassLoader.getSystemClassLoader();
             } catch (Throwable ex) {
-                // Cannot access system ClassLoader - oh well, maybe the caller can live with                    null...
+                // Cannot access system ClassLoader - oh well, maybe the caller can live with null...
             }
         }
     }
